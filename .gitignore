@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+
+# Temp files
+*.tmp
+*.log
+*.bak
+*.backup
+
+# Revit related backup
+*.rvt~
+*.rfa~
+*.slog
+
+# Excel temp files
+~$*.xlsx
+
+# OS X
+.DS_Store
