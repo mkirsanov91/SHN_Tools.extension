@@ -14,15 +14,15 @@ import re
 # =========================================================================
 
 # Path to SHN_Tools.extension
-BUTTON_DIR = os.path.dirname(__file__)       
-PANEL_DIR = os.path.dirname(BUTTON_DIR)      
-TAB_DIR = os.path.dirname(PANEL_DIR)         
-EXTENSION_DIR = os.path.dirname(TAB_DIR)     
+BUTTON_DIR = os.path.dirname(__file__)
+PANEL_DIR = os.path.dirname(BUTTON_DIR)
+TAB_DIR = os.path.dirname(PANEL_DIR)
+EXTENSION_DIR = os.path.dirname(TAB_DIR)
 
 # Path to Hook file
 HOOK_FILE = os.path.join(EXTENSION_DIR, 'hooks', 'doc-synced.py')
 
-# Path to Server Reports
+# Root path for reports on the server
 SERVER_ROOT_PATH = r"F:\REVIT_SHN\CHECK\Parameters_BOQ"
 
 # =========================================================================
@@ -33,23 +33,26 @@ def clean_filename(text):
     return re.sub(r'[\\/*?:"<>|]', '_', text).strip()
 
 def get_current_project_folder():
-    """Calculates report path for current project"""
+    """Calculates report path for current project."""
     doc = revit.doc
-    if not doc: return None
-    
+    if not doc:
+        return None
+
     try:
         p_info = doc.ProjectInformation
         p_name = p_info.Name if p_info.Name else "Unassigned_Project"
-        
+
         m_title = doc.Title
-        if m_title.lower().endswith('.rvt'): m_title = m_title[:-4]
-        
+        if m_title.lower().endswith('.rvt'):
+            m_title = m_title[:-4]
+
         safe_p = clean_filename(p_name)
         safe_m = clean_filename(m_title)
-        
+
         return os.path.join(SERVER_ROOT_PATH, safe_p, safe_m)
-    except:
-        return SERVER_ROOT_PATH
+    except Exception:
+        # Fallback to root if anything goes wrong
+        return None
 
 # =========================================================================
 # 3. BUTTON UI
@@ -58,19 +61,18 @@ def get_current_project_folder():
 # Check if hook file exists
 if os.path.exists(HOOK_FILE):
     status_msg = "ACTIVE"
-    # Using text instead of emoji to avoid encoding issues
-    status_symbol = "[ON]" 
+    status_symbol = "[ON]"   # Using text instead of emoji
 else:
     status_msg = "DISABLED (File not found)"
     status_symbol = "[OFF]"
 
-# Get current project folder
+# Get current project folder (where reports are exported)
 project_folder = get_current_project_folder()
 
 # Main Menu Alert
 res = forms.alert(
     "Auto-Export System: {} {}\n\n".format(status_msg, status_symbol) +
-    "Script location:\n{}".format(HOOK_FILE),
+    "Hook script location:\n{}".format(HOOK_FILE),
     title="SHNABEL Control Panel",
     options=["Open Report Folder", "Open Script Folder", "Cancel"],
     footer="Ver 1.0"
@@ -78,15 +80,33 @@ res = forms.alert(
 
 # Handle actions
 if res == "Open Report Folder":
-    if project_folder and os.path.exists(project_folder):
+    # First check that the server root exists at all
+    if not os.path.exists(SERVER_ROOT_PATH):
+        forms.alert(
+            "Report root path is not available.\n"
+            "Please make sure the server folder is accessible.",
+            title="Report Folder Error"
+        )
+
+    # If we could not determine project folder
+    elif not project_folder:
+        forms.alert(
+            "Report folder for this model could not be determined.\n"
+            "Please synchronize the model first to generate reports.",
+            title="Report Folder Not Found"
+        )
+
+    # If project folder exists – open it
+    elif os.path.exists(project_folder):
         os.startfile(project_folder)
+
+    # Project folder does not exist yet
     else:
-        # If specific folder missing, try opening root
-        if os.path.exists(SERVER_ROOT_PATH):
-            os.startfile(SERVER_ROOT_PATH)
-            forms.alert("Folder for this model does not exist yet (Sync required).\nOpened root folder instead.")
-        else:
-            forms.alert("Server path not found!")
+        forms.alert(
+            "Report folder for this model does not exist yet.\n"
+            "Please synchronize the model first to generate reports.",
+            title="Report Folder Not Found"
+        )
 
 elif res == "Open Script Folder":
     os.startfile(EXTENSION_DIR)
