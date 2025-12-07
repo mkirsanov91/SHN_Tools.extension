@@ -2,8 +2,9 @@
 """
 Check Auto-Export status and open report folder.
 """
-__title__ = 'System\nStatus'
-__author__ = 'SHNABEL Dept'
+__title__ = 'System\nReports'
+__doc__ = 'Check if the automatic export system is active for this Revit model and quickly access the report folder on the server.'
+__author__ = 'SHNABEL digital'
 
 from pyrevit import forms, script, revit
 import os
