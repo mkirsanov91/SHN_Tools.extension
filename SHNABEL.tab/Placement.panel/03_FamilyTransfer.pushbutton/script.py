@@ -4,6 +4,11 @@ Copy level-based lighting from linked model
 into host model using level-based target family.
 """
 
+__title__ = 'Family\nTransfer'
+__doc__ = 'Copy level-based lighting from linked model into host model using level-based target family.'
+__author__ = 'SHNABEL digital'
+
+
 from pyrevit import revit, DB, forms, script
 from System.Collections.Generic import List
 
