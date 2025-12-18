@@ -1,231 +1,286 @@
 # -*- coding: utf-8 -*-
+"""
+Export room boundaries from selected Revit link to DXF per Level
+for automatic room detection in DIALux evo (free).
 
-from Autodesk.Revit.UI.Selection import ObjectType
-import math
+For each Level in the linked architectural model:
+    - collect all Rooms on that level
+    - take their boundary loops
+    - transform to host coordinates, convert to meters
+    - write a separate DXF (R12) with closed POLYLINE entities on layer "ROOMS"
 
+In DIALux evo:
+    - For each floor, import corresponding DXF as plan
+    - Use "Create rooms from CAD polylines" to generate rooms automatically
+"""
+__title__ = 'Export\nRooms DXF'
+__author__ = 'SHNABEL digital'
 
-from pyrevit import script
-output = script.get_output()
-output.show() # <--- ЭТА КОМАНДА ОТКРЫВАЕТ ОКНО КОНСОЛИ
-print("Скрипт запущен...")
+import clr
+import System
+import os
 
+from pyrevit import revit, forms
 
-from System.Collections.Generic import List
-
-from pyrevit import revit, DB, forms, script
+clr.AddReference('RevitAPI')
+import Autodesk.Revit.DB as DB
 
 doc = revit.doc
-uidoc = revit.uidoc
-
-# --- КОНФИГУРАЦИЯ ---
-WORK_PLANE_HEIGHT_MM = 800  # Высота рабочей плоскости (мм)
-GRID_SIZE_MM = 500          # Шаг сетки (мм)
-ANALYSIS_NAME = "Анализ освещенности (Lambert)"
-
-# Конвертация единиц
 FT_TO_M = 0.3048
-MM_TO_FT = 1 / 304.8
 
-def setup_style(view, min_val=0, max_val=500):
-    """
-    Создает или обновляет стиль отображения (Цвета и Легенду).
-    """
-    style_name = "Heatmap_Lux_Style"
-    
-    # Пытаемся найти существующий стиль
-    collector = DB.FilteredElementCollector(doc).OfClass(DB.Analysis.AnalysisDisplayStyle)
-    style = None
-    for s in collector:
-        if s.Name == style_name:
-            style = s
-            break
-            
-    # Настройка цветов (Синий -> Зеленый -> Желтый -> Красный)
-    # Создаем градиент
-    color_settings = DB.Analysis.AnalysisDisplayColorSettings()
-    color_settings.MinColor = DB.Color(0, 0, 255)   # Синий (0 Lux)
-    color_settings.MaxColor = DB.Color(255, 0, 0)   # Красный (Max Lux)
-    
-    # Настройка легенды
-    legend_settings = DB.Analysis.AnalysisDisplayLegendSettings()
-    legend_settings.ShowLegend = True
-    legend_settings.NumberOfSteps = 10 # Количество делений
-    legend_settings.ShowDataDescription = False
-    
-    # Если стиля нет - создаем, если есть - обновляем
-    t_style = DB.Transaction(doc, "Настройка стиля")
-    t_style.Start()
-    try:
-        if not style:
-            style = DB.Analysis.AnalysisDisplayStyle.CreateAnalysisDisplayStyle(
-                doc, style_name, color_settings, legend_settings, legend_settings
-            )
-        else:
-            style.SetColorSettings(color_settings)
-            style.SetLegendSettings(legend_settings)
-        
-        # Применяем стиль к виду
-        view.AnalysisDisplayStyleId = style.Id
-    except Exception as e:
-        print("Ошибка стиля: {}".format(e))
-    t_style.Commit()
-    
-    return style
 
-# --- 1. ВЫБОР И ВВОД ДАННЫХ ---
-print("Пожалуйста, выберите помещение в Revit...")
+# -----------------------------------------------------------------------------
+# 1. Выбор архитектурного линка из списка
+# -----------------------------------------------------------------------------
+class LinkItem(object):
+    def __init__(self, inst, link_doc):
+        self.inst = inst
+        self.link_doc = link_doc
+        self._display = u"{}  (instance: {})".format(link_doc.Title, inst.Name)
 
-# Убираем try/except, чтобы видеть ошибку, если она есть
-sel_ref = uidoc.Selection.PickObject(ObjectType.Element, "Выберите помещение")
-room = doc.GetElement(sel_ref)
+    @property
+    def display(self):
+        return self._display
 
-# Проверка, что это комната
-if not isinstance(room, DB.Architecture.Room):
-    forms.alert("Вы тыкнули не в Room (Помещение)!", exitscript=True)
 
-print("Помещение выбрано: {}".format(room.Name))
-
-# Ввод люменов
-res_lumens = forms.ask_for_string(
-    default='3000',
-    prompt='Введите световой поток светильника (Люмен):',
-    title='Параметры Ламберта'
+link_instances = list(
+    DB.FilteredElementCollector(doc)
+    .OfClass(DB.RevitLinkInstance)
+    .WhereElementIsNotElementType()
 )
 
-if not res_lumens or not res_lumens.isdigit():
-    script.exit()
-    
-LUMENS_PER_FIXTURE = float(res_lumens)
+link_items = []
+for li in link_instances:
+    try:
+        ld = li.GetLinkDocument()
+        if ld:
+            link_items.append(LinkItem(li, ld))
+    except:
+        pass
 
-# --- 2. ПОДГОТОВКА ГЕОМЕТРИИ ---
+if not link_items:
+    forms.alert(
+        "No Revit links found in current model.\n"
+        "This tool expects an architectural model linked.",
+        title="Export Rooms DXF",
+        warn_icon=True
+    )
+    raise SystemExit
 
-# Находим светильники в комнате (грубый поиск по BBox)
-bbox = room.get_BoundingBox(None)
-outline = DB.Outline(bbox.Min, bbox.Max)
-bb_filter = DB.BoundingBoxIntersectsFilter(outline)
+sel = forms.SelectFromList.show(
+    link_items,
+    title="Select architectural link to export rooms as DXF (per level)",
+    multiselect=False,
+    name_attr='display'
+)
 
-collector = DB.FilteredElementCollector(doc)\
-    .OfCategory(DB.BuiltInCategory.OST_LightingFixtures)\
+if not sel:
+    raise SystemExit
+
+link_inst = sel.inst
+link_doc = sel.link_doc
+link_tr = link_inst.GetTransform()  # transform from link to host coords
+
+
+# -----------------------------------------------------------------------------
+# 2. Сбор комнат по уровням
+# -----------------------------------------------------------------------------
+opts = DB.SpatialElementBoundaryOptions()
+opts.SpatialElementBoundaryLocation = DB.SpatialElementBoundaryLocation.Finish
+
+rooms = DB.FilteredElementCollector(link_doc)\
+    .OfCategory(DB.BuiltInCategory.OST_Rooms)\
     .WhereElementIsNotElementType()\
-    .WherePasses(bb_filter)
+    .ToElements()
 
-room_lights_pos = []
-count_lights = 0
-for light in collector:
-    # Дополнительная проверка: точка светильника внутри комнаты?
-    pt = light.Location.Point
-    if room.IsPointInRoom(pt):
-        room_lights_pos.append(pt)
-        count_lights += 1
+# словарь: level_name -> [poly_1, poly_2, ...]
+# poly = [(x_m, y_m), ...]  (замкнутый контур, последняя точка = первая)
+level_polygons = {}
 
-if count_lights == 0:
-    forms.alert("В этом помещении не найдены светильники (проверьте уровень размещения).", exitscript=True)
+def norm_text(s):
+    if not s:
+        return u""
+    return s.replace(u'\ufeff', u'').replace(u'\u200f', u'').strip()
 
-# --- 3. ГЕНЕРАЦИЯ ТОЧЕК И РАСЧЕТ ---
+for room in rooms:
+    try:
+        if room.Area <= 0 or not room.Location:
+            continue
 
-points = []
-values = []
+        level = room.Level
+        lvl_name = norm_text(level.Name if level else "NoLevel")
 
-# Высота рабочей плоскости в футах
-z_plane = bbox.Min.Z + (WORK_PLANE_HEIGHT_MM * MM_TO_FT)
-step_ft = GRID_SIZE_MM * MM_TO_FT
+        boundaries = room.GetBoundarySegments(opts)
+        if not boundaries:
+            continue
 
-x_min, x_max = bbox.Min.X, bbox.Max.X
-y_min, y_max = bbox.Min.Y, bbox.Max.Y
+        # обычно первая петля — внешний контур
+        loop = boundaries[0]
+        pts = []
+        for seg in loop:
+            curve = seg.GetCurve()
+            p = curve.GetEndPoint(0)
+            # координаты линка -> в хост
+            p_host = link_tr.OfPoint(p)
+            x_m = p_host.X * FT_TO_M
+            y_m = p_host.Y * FT_TO_M
+            pts.append((x_m, y_m))
 
-# Интенсивность (Candela) для изотропного источника
-# I = Flux / 4Pi
-intensity_candela = LUMENS_PER_FIXTURE / (4 * math.pi)
+        if len(pts) < 3:
+            continue
 
-print("Расчет точек... Светильников: {}".format(count_lights))
+        # закрываем полигон
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
 
-x = x_min
-while x < x_max:
-    y = y_min
-    while y < y_max:
-        pt_calc = DB.XYZ(x, y, z_plane)
-        
-        if room.IsPointInRoom(pt_calc):
-            total_lux = 0.0
-            
-            for light_pos in room_lights_pos:
-                # Вектор от точки к свету
-                vec = light_pos - pt_calc
-                dist_ft = vec.GetLength()
-                dist_m = dist_ft * FT_TO_M
-                
-                # Защита от деления на ноль (если точка прямо в лампе)
-                if dist_m < 0.1: 
-                    dist_m = 0.1
-                
-                # Косинус угла падения (alpha)
-                # Нормаль пола (0,0,1). Угол между вектором ВВЕРХ (к свету) и нормалью.
-                # cos(alpha) = Z_component / Length
-                cos_alpha = vec.Z / dist_ft 
-                if cos_alpha < 0: cos_alpha = 0 # Свет снизу не считаем
-                
-                # E = (I * cos(a)) / R^2
-                lux = (intensity_candela * cos_alpha) / (dist_m ** 2)
-                total_lux += lux
-            
-            # Сохраняем результат
-            points.append(pt_calc)
-            
-            # Revit AVF принимает значение как ValueAtPoint
-            val = DB.Analysis.ValueAtPoint([total_lux])
-            values.append(val)
-            
-    y += step_ft
-x += step_ft
+        if lvl_name not in level_polygons:
+            level_polygons[lvl_name] = []
+        level_polygons[lvl_name].append(pts)
 
-if not points:
-    forms.alert("Точки расчета не попали внутрь комнаты. Проверьте границы.", exitscript=True)
+    except Exception as e:
+        print("Error processing room {} in link {}: {}".format(
+            room.Id, link_doc.Title, e)
+        )
 
-# --- 4. ВИЗУАЛИЗАЦИЯ (AVF) ---
+if not level_polygons:
+    forms.alert(
+        "No valid room boundaries found in link:\n{}".format(link_doc.Title),
+        title="Export Rooms DXF",
+        warn_icon=True
+    )
+    raise SystemExit
 
-t = DB.Transaction(doc, "Расчет освещенности")
-t.Start()
 
-# Получаем менеджер для текущего вида
-sfm = DB.Analysis.SpatialFieldManager.GetSpatialFieldManager(doc.ActiveView)
-if not sfm:
-    sfm = DB.Analysis.SpatialFieldManager.CreateSpatialFieldManager(doc.ActiveView, 1)
+# -----------------------------------------------------------------------------
+# 3. Выбор папки
+# -----------------------------------------------------------------------------
+folder = forms.pick_folder(title="Select folder to save DXF files for DIALux")
+if not folder:
+    raise SystemExit
 
-sfm.Clear() # Очистить старые результаты
+proj_name = doc.ProjectInformation.Name or doc.Title or "Revit_Project"
+if ".rvt" in proj_name.lower():
+    proj_name = proj_name.replace(".rvt", "").replace(".RVT", "")
 
-# Регистрируем схему результата (метаданные)
-schema_name = "Lux Calculation"
-registered_results = sfm.GetRegisteredResults()
-schema_idx = 0
-found = False
+invalid = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+for ch in invalid:
+    proj_name = proj_name.replace(ch, "_")
 
-for i in registered_results:
-    s = sfm.GetResultSchema(i)
-    if s.Name == schema_name:
-        schema_idx = i
-        found = True
-        break
 
-if not found:
-    schema = DB.Analysis.AnalysisResultSchema(schema_name, "Illuminance Analysis")
-    schema_idx = sfm.RegisterResult(schema)
+def safe_name(s):
+    if not s:
+        return "NoLevel"
+    for ch in invalid:
+        s = s.replace(ch, "_")
+    return s
 
-# Создаем примитив (облако точек)
-idx_primitive = sfm.AddSpatialFieldPrimitive()
 
-# Подготовка данных для API (требует IList)
-p_list = List[DB.XYZ](points)
-v_list = List[DB.Analysis.ValueAtPoint](values)
+# -----------------------------------------------------------------------------
+# 4. Функция записи DXF R12 (AC1009) с POLYLINE/VERTEX
+# -----------------------------------------------------------------------------
+def write_dxf(polys, path):
+    lines = []
 
-field_points = DB.Analysis.FieldDomainPointsByXYZ(p_list)
-field_values = DB.Analysis.FieldValues(v_list)
+    # HEADER – минимальный
+    lines.extend([
+        "0", "SECTION",
+        "2", "HEADER",
+        "9", "$ACADVER",
+        "1", "AC1009",     # R12 – максимально совместимая версия
+        "0", "ENDSEC",
+    ])
 
-# Записываем данные
-sfm.UpdateSpatialFieldPrimitive(idx_primitive, field_points, field_values, schema_idx)
+    # TABLES – определяем слой ROOMS
+    lines.extend([
+        "0", "SECTION",
+        "2", "TABLES",
+        "0", "TABLE",
+        "2", "LAYER",
+        "70", "1",       # number of entries
+        "0", "LAYER",
+        "2", "ROOMS",    # layer name
+        "70", "0",
+        "62", "7",       # color (7 = white)
+        "6", "CONTINUOUS",
+        "0", "ENDTAB",
+        "0", "ENDSEC",
+    ])
 
-# Применяем красивый стиль
-setup_style(doc.ActiveView, min_val=0, max_val=500)
+    # ENTITIES – наши полигоны
+    lines.extend([
+        "0", "SECTION",
+        "2", "ENTITIES",
+    ])
 
-t.Commit()
+    for poly in polys:
+        n = len(poly)
+        if n < 3:
+            continue
 
-print("Готово! Рассчитано точек: {}. Макс. значение: {:.1f} Lux".format(len(points), max([v.GetValues()[0] for v in values])))
+        # Нормальная polyline с вершинами
+        lines.extend([
+            "0", "POLYLINE",
+            "8", "ROOMS",   # layer
+            "66", "1",      # vertices follow
+            "70", "1",      # closed polyline
+        ])
+
+        for (x, y) in poly:
+            lines.extend([
+                "0", "VERTEX",
+                "8", "ROOMS",
+                "10", "{:.6f}".format(x),
+                "20", "{:.6f}".format(y),
+            ])
+
+        lines.extend([
+            "0", "SEQEND",
+        ])
+
+    # END ENTITIES
+    lines.extend([
+        "0", "ENDSEC",
+        "0", "EOF",
+    ])
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+
+# -----------------------------------------------------------------------------
+# 5. Для каждого уровня – свой DXF, с локальной нормализацией координат
+# -----------------------------------------------------------------------------
+created_files = []
+
+for lvl_name, polys in level_polygons.items():
+    # нормализуем координаты в пределах уровня, чтобы план был рядом с (0,0)
+    min_x = min(pt[0] for poly in polys for pt in poly)
+    min_y = min(pt[1] for poly in polys for pt in poly)
+
+    norm_polys = []
+    for poly in polys:
+        norm = [(x - min_x, y - min_y) for (x, y) in poly]
+        norm_polys.append(norm)
+
+    lvl_safe = safe_name(lvl_name)
+    filename = u"{}_{}_RoomsForDialux.dxf".format(proj_name, lvl_safe)
+    filepath = os.path.join(folder, filename)
+
+    write_dxf(norm_polys, filepath)
+    created_files.append(filepath)
+
+
+# -----------------------------------------------------------------------------
+# 6. Сообщение пользователю
+# -----------------------------------------------------------------------------
+msg = "DXF export finished.\n\nCreated files:\n"
+for fp in created_files:
+    msg += "  - {}\n".format(fp)
+
+msg += (
+    "\nIn DIALux evo for each level:\n"
+    "  1) Import corresponding DXF as plan\n"
+    "  2) Use 'Create rooms from CAD polylines' to generate rooms automatically."
+)
+
+forms.alert(msg, title="Export Rooms DXF", warn_icon=False)

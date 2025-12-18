@@ -10,7 +10,7 @@ HTML report:
 - Filter panel with checkboxes for "Has Ceiling" and "Source".
 """
 
-__title__ = 'System\nReports'
+__title__ = 'Room\nList'
 __doc__ = 'Exports room data to CSV and HTML with English headers, Ceiling detection (by checking ceilings bounding boxes in the same document as the room), and Door Count per room (from FromRoom/ToRoom across all phases)'
 __author__ = 'SHNABEL digital'
 
