@@ -1,31 +1,29 @@
 # -*- coding: utf-8 -*-
-# SHN Opening Browser (v0.1) - pyRevit / IronPython
+# SHN Opening Browser (v0.2) - pyRevit / IronPython
+# FIXED: Manager window now properly displays and navigates openings
 # - Place/Update face-based Generic Model openings on LINKED walls
 # - Openings are oriented 90° to wall (Depth along wall normal)
 # - Cluster nearby penetrations (tray/pipe packages) into one opening
-# - Audit: Missing / NeedResize / Empty (+ optional delete/approve empty)
-#
-# Opening Manager:
-# - Can be opened directly from the first mode window (no need to re-run computations)
-# - Lists ALL openings of the selected family
-# - Supports: Select / Show / Temporary Isolate / Clear isolate / Delete
-# - Prev/Next navigation
-# - Each item shows Level name (best-effort) + dimensions
+# - Audit: Missing / NeedResize / Empty
 
 from pyrevit import revit, DB, forms, script
 from System.Collections.Generic import List
 
-# WPF XAML parsing (no System.Xml)
 import clr
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
 clr.AddReference("System")
+clr.AddReference("RevitAPIUI")
+
 from System.Windows.Markup import XamlReader
+from System.Windows.Interop import WindowInteropHelper
+from Autodesk.Revit.UI import IExternalEventHandler, ExternalEvent
 
 doc = revit.doc
 uidoc = revit.uidoc
 output = script.get_output()
+uiapp = uidoc.Application
 
 # -----------------------------
 # Defaults / Parameter name fallbacks
@@ -33,7 +31,7 @@ output = script.get_output()
 DEFAULT_FAMILY_NAME = "SHN_Openings_GEN_Square FaceBased"
 
 WIDTH_NAMES  = ["Width"]
-HEIGHT_NAMES = ["Highet", "Hight", "Height"]  # your family currently uses "Highet"
+HEIGHT_NAMES = ["Highet", "Hight", "Height"]
 DEPTH_NAMES  = ["Depth"]
 
 FROM_LINK_NAMES    = ["From Link", "SHN_FromLink"]
@@ -41,6 +39,7 @@ ID_IN_LINK_NAMES   = ["ID in Link", "SHN_IDinLink"]
 APPROVED_NAMES     = ["Approved", "SHN_Approved"]
 CHANGED_NAMES      = ["Changed", "SHN_Changed"]
 NEW_NAMES          = ["New", "SHN_New"]
+
 
 # -----------------------------
 # Units
@@ -50,6 +49,7 @@ def mm_to_ft(mm):
 
 def ft_to_mm(ft):
     return float(ft) * 304.8
+
 
 # -----------------------------
 # Safe parameter helpers
@@ -129,7 +129,6 @@ def is_param_checked(elem, names):
     return False
 
 def ensure_symbol_active(sym):
-    """Safe Activate: if document not modifiable, open a short transaction."""
     if not sym:
         return
     try:
@@ -147,6 +146,7 @@ def ensure_symbol_active(sym):
     except:
         pass
 
+
 # -----------------------------
 # Geometry helpers
 # -----------------------------
@@ -159,7 +159,6 @@ def norm(xyz):
     return None
 
 def aabb_from_bbox(bb, trf=None):
-    """Return (minXYZ, maxXYZ) in host coords; if trf given, bbox is in link coords."""
     if not bb:
         return None
     pts = []
@@ -193,7 +192,6 @@ def aabb_intersects(a_min, a_max, b_min, b_max, tol=0.0):
     return True
 
 def iter_solids(geom_elem):
-    """Yield solids with Volume>0 from GeometryElement (including instances)."""
     if not geom_elem:
         return
     for g in geom_elem:
@@ -214,7 +212,7 @@ def planar_faces_from_solid(solid):
         for f in solid.Faces:
             if isinstance(f, DB.PlanarFace):
                 n = f.FaceNormal
-                if abs(n.Z) < 0.3:  # side faces
+                if abs(n.Z) < 0.3:
                     faces.append(f)
     except:
         pass
@@ -232,6 +230,7 @@ def project_point_to_plane(p, plane_origin, plane_normal):
     v = p - plane_origin
     d = v.DotProduct(plane_normal)
     return p - (plane_normal.Multiply(d))
+
 
 # -----------------------------
 # Rect / clustering
@@ -295,6 +294,7 @@ def cluster_rects(rects, gap):
         clusters = out
     return clusters
 
+
 # -----------------------------
 # Collectors / UI
 # -----------------------------
@@ -320,7 +320,7 @@ def get_symbol_names(sym):
 
     if not type_name:
         try:
-            type_name = sym.LookupParameter("Type Name").AsString()
+            type_name = sym.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
         except:
             type_name = "Type"
 
@@ -445,17 +445,28 @@ def get_mep_elements():
     return [e for e in els]
 
 def collect_existing_openings(opening_family_id):
+    fam_int = None
+    try:
+        fam_int = opening_family_id.IntegerValue
+    except:
+        try:
+            fam_int = int(opening_family_id)
+        except:
+            fam_int = None
+    if fam_int is None:
+        return []
+
     res = []
-    fec = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_GenericModel).WhereElementIsNotElementType()
+    fec = DB.FilteredElementCollector(doc).OfClass(DB.FamilyInstance).WhereElementIsNotElementType()
     for e in fec:
         try:
-            if isinstance(e, DB.FamilyInstance):
-                sym = e.Symbol
-                if sym and sym.Family and sym.Family.Id == opening_family_id:
-                    res.append(e)
+            sym = e.Symbol
+            if sym and sym.Family and sym.Family.Id and sym.Family.Id.IntegerValue == fam_int:
+                res.append(e)
         except:
             pass
     return res
+
 
 # -----------------------------
 # Wall data cache
@@ -546,7 +557,7 @@ def build_walls_cache(link_instances):
                     continue
 
                 try:
-                    bbuv = best_face.GetBoundingBox()  # BoundingBoxUV
+                    bbuv = best_face.GetBoundingBox()
                 except:
                     continue
 
@@ -588,6 +599,7 @@ def make_link_face_reference(link_inst, face_ref):
             return DB.Reference.CreateLinkReference(link_inst, face_ref)
         except:
             return None
+
 
 # -----------------------------
 # Core computation
@@ -763,6 +775,7 @@ def find_best_opening_for_request(req_center_uv, openings, wd, search_tol_ft):
         return best
     return None
 
+
 # -----------------------------
 # Placement / update
 # -----------------------------
@@ -905,18 +918,21 @@ def place_or_update_openings(opening_symbol, walls_cache, clustered_by_wall, dep
 
     return (created, updated, missing_requests, need_resize, empty)
 
+
 # -----------------------------
-# Opening Manager Window (persistent; no checkboxes)
+# Opening Manager (MODELLESS) - FIXED VERSION
 # -----------------------------
 _MANAGER_XAML = """
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="SHN Opening Manager"
-        Height="680" Width="720"
+        Height="720" Width="820"
         WindowStartupLocation="CenterScreen"
-        Topmost="True">
+        Topmost="False"
+        ShowInTaskbar="False">
   <Grid Margin="10">
     <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
@@ -925,9 +941,18 @@ _MANAGER_XAML = """
     </Grid.RowDefinitions>
 
     <TextBlock x:Name="TxtHeader" Grid.Row="0" FontSize="14" FontWeight="Bold" Margin="0,0,0,6" />
-    <TextBlock x:Name="TxtInfo" Grid.Row="1" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,10" />
+    <TextBlock x:Name="TxtInfo" Grid.Row="1" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8" />
 
-    <GroupBox Grid.Row="2" Header="Openings (double-click to isolate ONE)" Margin="0,0,0,10">
+    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
+      <TextBlock Text="Source:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+      <ComboBox x:Name="CmbSource" Width="320">
+        <ComboBoxItem Content="This Run (Created/Updated)" IsSelected="True"/>
+        <ComboBoxItem Content="All in Model (Selected family)"/>
+      </ComboBox>
+      <TextBlock x:Name="TxtCounts" VerticalAlignment="Center" Margin="12,0,0,0" Foreground="Gray"/>
+    </StackPanel>
+
+    <GroupBox Grid.Row="3" Header="Openings (double-click = Isolate ONE)" Margin="0,0,0,10">
       <Grid Margin="8">
         <Grid.RowDefinitions>
           <RowDefinition Height="*"/>
@@ -937,17 +962,17 @@ _MANAGER_XAML = """
         <ListBox x:Name="LstOpenings" Grid.Row="0" />
 
         <TextBlock Grid.Row="1" Margin="0,8,0,0" FontSize="11" Foreground="Gray"
-                   Text="Tip: Use Select to change parameters in Properties. If not visible on the current view, open 3D/another view and isolate again." />
+                   Text="Tip: Revit stays active. Click in Revit view to orbit/pan. Use Isolate to focus on an opening." />
       </Grid>
     </GroupBox>
 
-    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Left">
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Left">
       <Button x:Name="BtnPrev" Content="Prev" Width="70" Margin="0,0,6,0"/>
       <Button x:Name="BtnNext" Content="Next" Width="70" Margin="0,0,6,0"/>
-      <Button x:Name="BtnRefresh" Content="Refresh list" Width="95" Margin="0,0,6,0"/>
+      <Button x:Name="BtnRefresh" Content="Refresh" Width="90" Margin="0,0,6,0"/>
     </StackPanel>
 
-    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
       <Button x:Name="BtnSelect" Content="Select" Width="70" Margin="0,0,6,0"/>
       <Button x:Name="BtnShow" Content="Show" Width="70" Margin="0,0,6,0"/>
       <Button x:Name="BtnIsolate" Content="Isolate" Width="80" Margin="0,0,6,0"/>
@@ -956,8 +981,8 @@ _MANAGER_XAML = """
       <Button x:Name="BtnClose" Content="Close" Width="70"/>
     </StackPanel>
 
-    <TextBlock x:Name="TxtFooter" Grid.Row="4" FontSize="11" Foreground="Gray" Margin="0,8,0,0"
-               Text="Delete uses a Revit transaction. Prev/Next moves selection in the list."/>
+    <TextBlock x:Name="TxtFooter" Grid.Row="5" FontSize="11" Foreground="Gray" Margin="0,8,0,0"
+               Text="Modeless window: Revit remains active. Actions run through ExternalEvent."/>
   </Grid>
 </Window>
 """
@@ -966,13 +991,13 @@ def _load_window_from_xaml(xaml_text):
     return XamlReader.Parse(xaml_text)
 
 def get_level_name(inst):
-    """Best-effort level name for FamilyInstance."""
+    """Best-effort level name. Always returns non-empty."""
     try:
         lid = inst.LevelId
         if lid and lid.IntegerValue > 0:
             lvl = doc.GetElement(lid)
-            if lvl:
-                return lvl.Name
+            if lvl and (lvl.Name or "").strip():
+                return (lvl.Name or "").strip()
     except:
         pass
 
@@ -988,91 +1013,90 @@ def get_level_name(inst):
         try:
             p = inst.get_Parameter(bip)
             if p and p.HasValue:
-                lid = p.AsElementId()
-                if lid and lid.IntegerValue > 0:
-                    lvl = doc.GetElement(lid)
-                    if lvl:
-                        return lvl.Name
+                lid2 = p.AsElementId()
+                if lid2 and lid2.IntegerValue > 0:
+                    lvl2 = doc.GetElement(lid2)
+                    if lvl2 and (lvl2.Name or "").strip():
+                        return (lvl2.Name or "").strip()
         except:
             pass
 
     try:
         p = inst.LookupParameter("Level")
         if p and p.HasValue:
-            return p.AsString() or p.AsValueString()
+            s = (p.AsString() or "").strip()
+            if s:
+                return s
+            vs = (p.AsValueString() or "").strip()
+            if vs:
+                return vs
     except:
         pass
 
     return "?"
 
-def _format_opening_item(eid_int):
-    """Displayed row text. Must start with: 'Id <num>' for parsing."""
+def _format_opening_row(eid_int, prefix=None):
+    """Row must contain 'Id <num>' for parsing. FIXED: Better error handling."""
     try:
         e = doc.GetElement(DB.ElementId(int(eid_int)))
         if not e:
-            return "Id {}".format(eid_int)
+            base = "Id {}".format(eid_int)
+        else:
+            lvl = get_level_name(e)
+            pw = lookup_param_any(e, WIDTH_NAMES)
+            ph = lookup_param_any(e, HEIGHT_NAMES)
+            pd = lookup_param_any(e, DEPTH_NAMES)
 
-        lvl = get_level_name(e)
+            wmm = None
+            hmm = None
+            dmm = None
+            
+            if pw and pw.HasValue:
+                try:
+                    wmm = ft_to_mm(pw.AsDouble())
+                except:
+                    pass
+            if ph and ph.HasValue:
+                try:
+                    hmm = ft_to_mm(ph.AsDouble())
+                except:
+                    pass
+            if pd and pd.HasValue:
+                try:
+                    dmm = ft_to_mm(pd.AsDouble())
+                except:
+                    pass
 
-        pw = lookup_param_any(e, WIDTH_NAMES)
-        ph = lookup_param_any(e, HEIGHT_NAMES)
-        pd = lookup_param_any(e, DEPTH_NAMES)
+            if wmm is not None and hmm is not None and dmm is not None:
+                base = "Id {} | Level: {} | {:.0f} x {:.0f} x {:.0f} mm".format(eid_int, lvl, wmm, hmm, dmm)
+            elif wmm is not None and hmm is not None:
+                base = "Id {} | Level: {} | {:.0f} x {:.0f} mm".format(eid_int, lvl, wmm, hmm)
+            else:
+                base = "Id {} | Level: {}".format(eid_int, lvl)
 
-        wmm = ft_to_mm(pw.AsDouble()) if pw else None
-        hmm = ft_to_mm(ph.AsDouble()) if ph else None
-        dmm = ft_to_mm(pd.AsDouble()) if pd else None
+        if prefix:
+            return "[{}] {}".format(prefix, base)
+        return base
+    except Exception as ex:
+        if prefix:
+            return "[{}] Id {} (Error: {})".format(prefix, eid_int, str(ex))
+        return "Id {} (Error: {})".format(eid_int, str(ex))
 
-        if wmm is not None and hmm is not None:
-            if dmm is not None:
-                return "Id {} | Level: {} | {:.0f} x {:.0f} x {:.0f} mm".format(eid_int, lvl, wmm, hmm, dmm)
-            return "Id {} | Level: {} | {:.0f} x {:.0f} mm".format(eid_int, lvl, wmm, hmm)
-
-        return "Id {} | Level: {}".format(eid_int, lvl)
-    except:
-        return "Id {}".format(eid_int)
-
-def _set_selection_one(eid_int):
+def _parse_id_from_row(row_text):
+    """Parse element ID from list row."""
     try:
-        ids = List[DB.ElementId]([DB.ElementId(int(eid_int))])
-        uidoc.Selection.SetElementIds(ids)
-        return ids
-    except:
-        return None
-
-def _show_elements(ids):
-    try:
-        uidoc.ShowElements(ids)
-        return True
-    except:
-        try:
-            if ids and ids.Count > 0:
-                uidoc.ShowElements(ids[0])
-                return True
-        except:
-            pass
-    return False
-
-def _isolate_ids(ids):
-    try:
-        v = uidoc.ActiveView
-        if not v:
-            return False
-        v.IsolateElementsTemporary(ids)
-        return True
-    except:
-        return False
-
-def _clear_isolate():
-    try:
-        v = uidoc.ActiveView
-        if v and v.IsTemporaryHideIsolateActive:
-            v.DisableTemporaryViewMode(DB.TemporaryViewMode.TemporaryHideIsolate)
-            return True
+        s = str(row_text).strip()
+        if s.startswith("[") and "]" in s:
+            s = s.split("]", 1)[1].strip()
+        parts = s.split()
+        if len(parts) >= 2 and parts[0] == "Id":
+            return int(parts[1])
     except:
         pass
-    return False
+    return None
 
-def _collect_openings_ids_for_family(opening_family_id):
+def _collect_all_openings_ids_for_family(opening_family_id):
+    """Collect all openings and sort by level."""
     els = collect_existing_openings(opening_family_id)
     ids = []
     for e in els:
@@ -1094,18 +1118,196 @@ def _collect_openings_ids_for_family(opening_family_id):
         pass
     return ids
 
+
+class _ManagerExternalHandler(IExternalEventHandler):
+    def __init__(self):
+        self.action = None
+        self.ids = []
+        self.pick_id = None
+
+        self.win = None
+        self.lst = None
+        self.cmb = None
+        self.txt_counts = None
+
+        self.family_id = None
+        self.run_created = []
+        self.run_updated = []
+
+        self._ev = None
+
+    def GetName(self):
+        return "SHN Opening Manager ExternalEvent"
+
+    def _source_index(self):
+        try:
+            if self.cmb is None:
+                return 0
+            return int(self.cmb.SelectedIndex)
+        except:
+            return 0
+
+    def Execute(self, uiapp_exec):
+        try:
+            uidoc_exec = uiapp_exec.ActiveUIDocument
+            doc_exec = uidoc_exec.Document
+
+            action = self.action
+            ids = list(self.ids) if self.ids else []
+            pick_id = self.pick_id
+
+            self.action = None
+            self.ids = []
+            self.pick_id = None
+
+            if action == "refresh":
+                if self.lst is None:
+                    return
+
+                src = self._source_index()
+
+                self.lst.Items.Clear()
+
+                if src == 0:
+                    # This Run (Created + Updated)
+                    for i in self.run_created:
+                        self.lst.Items.Add(_format_opening_row(i, prefix="C"))
+                    for i in self.run_updated:
+                        self.lst.Items.Add(_format_opening_row(i, prefix="U"))
+
+                    if self.txt_counts is not None:
+                        self.txt_counts.Text = "This Run: Created {} / Updated {}".format(
+                            len(self.run_created), len(self.run_updated))
+
+                else:
+                    # All in model
+                    ids_all = []
+                    if self.family_id is not None:
+                        ids_all = _collect_all_openings_ids_for_family(self.family_id)
+
+                    for oid in ids_all:
+                        self.lst.Items.Add(_format_opening_row(oid))
+
+                    if self.txt_counts is not None:
+                        self.txt_counts.Text = "All in Model: {}".format(len(ids_all))
+
+                # Auto-select first item
+                try:
+                    if self.lst.Items.Count > 0:
+                        if pick_id is not None:
+                            # Try to restore selection
+                            for idx in range(self.lst.Items.Count):
+                                if ("Id {}".format(pick_id)) in str(self.lst.Items[idx]):
+                                    self.lst.SelectedIndex = idx
+                                    break
+                            if self.lst.SelectedIndex < 0:
+                                self.lst.SelectedIndex = 0
+                        else:
+                            self.lst.SelectedIndex = 0
+                except:
+                    pass
+                return
+
+            if action == "select":
+                if not ids: return
+                sel = List[DB.ElementId]([DB.ElementId(int(i)) for i in ids])
+                uidoc_exec.Selection.SetElementIds(sel)
+                return
+
+            if action == "show":
+                if not ids: return
+                sel = List[DB.ElementId]([DB.ElementId(int(i)) for i in ids])
+                uidoc_exec.Selection.SetElementIds(sel)
+                uidoc_exec.ShowElements(sel)
+                return
+
+            if action == "isolate":
+                if not ids: return
+                sel = List[DB.ElementId]([DB.ElementId(int(i)) for i in ids])
+                uidoc_exec.Selection.SetElementIds(sel)
+                uidoc_exec.ShowElements(sel)
+                v = uidoc_exec.ActiveView
+                if v:
+                    v.IsolateElementsTemporary(sel)
+                return
+
+            if action == "clear_isolate":
+                v = uidoc_exec.ActiveView
+                try:
+                    if v and v.IsTemporaryHideIsolateActive():
+                        v.DisableTemporaryViewMode(DB.TemporaryViewMode.TemporaryHideIsolate)
+                except:
+                    pass
+                return
+
+            if action == "delete":
+                if not ids: return
+                t = DB.Transaction(doc_exec, "SHN Opening Manager - Delete")
+                t.Start()
+                try:
+                    for i in ids:
+                        try:
+                            doc_exec.Delete(DB.ElementId(int(i)))
+                        except:
+                            pass
+                finally:
+                    t.Commit()
+                self.action = "refresh"
+                self._ev.Raise()
+                return
+
+        except Exception as ex:
+            print("ExternalEvent Execute error: {}".format(str(ex)))
+
+    def raise_(self, action, ids=None, pick_id=None):
+        self.action = action
+        self.ids = list(ids or [])
+        self.pick_id = pick_id
+        try:
+            self._ev.Raise()
+        except:
+            pass
+
+
+__shn_manager_window__ = None
+__shn_manager_handler__ = None
+__shn_manager_event__ = None
+
+
 def show_opening_manager(opening_symbol, created_ids=None, updated_ids=None):
-    """Manager lists ALL openings of the selected family, not only created."""
+    """FIXED: Now properly initializes and displays opening list."""
+    global __shn_manager_window__, __shn_manager_handler__, __shn_manager_event__
+
     created_ids = created_ids or []
     updated_ids = updated_ids or []
 
     fam_id = opening_symbol.Family.Id
     fam_name, type_name = get_symbol_names(opening_symbol)
 
+    # Already open -> update + refresh
+    if __shn_manager_window__ is not None:
+        try:
+            __shn_manager_window__.Activate()
+            if __shn_manager_handler__:
+                __shn_manager_handler__.family_id = fam_id
+                __shn_manager_handler__.run_created = list(created_ids)
+                __shn_manager_handler__.run_updated = list(updated_ids)
+                __shn_manager_handler__.raise_("refresh")
+            return
+        except:
+            __shn_manager_window__ = None
+
     win = _load_window_from_xaml(_MANAGER_XAML)
+
+    try:
+        WindowInteropHelper(win).Owner = uiapp.MainWindowHandle
+    except:
+        pass
 
     txtHeader = win.FindName("TxtHeader")
     txtInfo   = win.FindName("TxtInfo")
+    cmb       = win.FindName("CmbSource")
+    txtCounts = win.FindName("TxtCounts")
     lst       = win.FindName("LstOpenings")
 
     btnPrev    = win.FindName("BtnPrev")
@@ -1119,109 +1321,112 @@ def show_opening_manager(opening_symbol, created_ids=None, updated_ids=None):
     btnDelete = win.FindName("BtnDelete")
     btnClose  = win.FindName("BtnClose")
 
-    txtHeader.Text = "SHN Opening Manager"
-    txtInfo.Text = "Family: {} | Type: {}\nThis run: Created {} / Updated {}. List below shows ALL openings of this family.".format(
-        fam_name, type_name, len(created_ids), len(updated_ids)
-    )
+    if txtHeader:
+        txtHeader.Text = "SHN Opening Manager"
+    if txtInfo:
+        txtInfo.Text = (
+            "Family: {} | Type: {}\n"
+            "Navigate openings with Prev/Next or double-click to isolate."
+        ).format(fam_name, type_name)
 
-    created_set = set(created_ids)
+    handler = _ManagerExternalHandler()
+    ev = ExternalEvent.Create(handler)
+    handler._ev = ev
 
-    def refresh_list(select_id=None):
-        lst.Items.Clear()
-        ids = _collect_openings_ids_for_family(fam_id)
-        for oid in ids:
-            row = _format_opening_item(oid)
-            if oid in created_set:
-                row = "* " + row
-            lst.Items.Add(row)
+    handler.win = win
+    handler.lst = lst
+    handler.cmb = cmb
+    handler.txt_counts = txtCounts
 
-        if select_id is not None:
-            for idx in range(lst.Items.Count):
-                s = str(lst.Items[idx])
-                if ("Id {}".format(select_id)) in s:
-                    lst.SelectedIndex = idx
-                    break
-        elif lst.Items.Count > 0 and lst.SelectedIndex < 0:
-            lst.SelectedIndex = 0
+    handler.family_id = fam_id
+    handler.run_created = list(created_ids)
+    handler.run_updated = list(updated_ids)
 
-    def current_selected_eid():
+    __shn_manager_window__ = win
+    __shn_manager_handler__ = handler
+    __shn_manager_event__ = ev
+
+    def current_selected_id():
         try:
-            item = lst.SelectedItem
-            if not item:
-                return None
-            s = str(item).lstrip("*").strip()
-            parts = s.split()
-            if len(parts) >= 2 and parts[0] == "Id":
-                return int(parts[1])
+            if lst and lst.SelectedItem:
+                return _parse_id_from_row(lst.SelectedItem)
         except:
             pass
         return None
 
-    def do_select():
-        oid = current_selected_eid()
-        if oid is None: return
-        _set_selection_one(oid)
-
-    def do_show():
-        oid = current_selected_eid()
-        if oid is None: return
-        ids = _set_selection_one(oid)
-        if ids: _show_elements(ids)
-
     def do_isolate():
-        oid = current_selected_eid()
+        oid = current_selected_id()
         if oid is None: return
-        ids = _set_selection_one(oid)
-        if ids:
-            _show_elements(ids)
-            _isolate_ids(ids)
+        handler.raise_("isolate", [oid])
 
     def do_prev():
-        if lst.Items.Count == 0: return
+        if not lst or lst.Items.Count == 0: return
         idx = lst.SelectedIndex
-        if idx < 0: lst.SelectedIndex = 0
-        else: lst.SelectedIndex = max(0, idx - 1)
+        if idx < 0: idx = 0
+        lst.SelectedIndex = max(0, idx - 1)
         do_isolate()
 
     def do_next():
-        if lst.Items.Count == 0: return
+        if not lst or lst.Items.Count == 0: return
         idx = lst.SelectedIndex
-        if idx < 0: lst.SelectedIndex = 0
-        else: lst.SelectedIndex = min(lst.Items.Count - 1, idx + 1)
+        if idx < 0: idx = 0
+        lst.SelectedIndex = min(lst.Items.Count - 1, idx + 1)
         do_isolate()
 
+    def do_refresh():
+        handler.raise_("refresh", pick_id=current_selected_id())
+
+    def do_select():
+        oid = current_selected_id()
+        if oid is None: return
+        handler.raise_("select", [oid])
+
+    def do_show():
+        oid = current_selected_id()
+        if oid is None: return
+        handler.raise_("show", [oid])
+
     def do_delete():
-        oid = current_selected_eid()
+        oid = current_selected_id()
         if oid is None: return
         res = forms.alert("Delete opening Id {}?".format(oid), title="SHN", yes=True, no=True)
         if not res: return
+        handler.raise_("delete", [oid])
 
-        t = DB.Transaction(doc, "SHN Opening Manager - Delete")
-        t.Start()
-        try:
-            doc.Delete(DB.ElementId(int(oid)))
-        except:
-            pass
-        t.Commit()
-
-        idx = lst.SelectedIndex
-        refresh_list(select_id=None)
-        if lst.Items.Count > 0:
-            lst.SelectedIndex = min(max(0, idx), lst.Items.Count - 1)
+    btnPrev.Click    += lambda s, a: do_prev()
+    btnNext.Click    += lambda s, a: do_next()
+    btnRefresh.Click += lambda s, a: do_refresh()
 
     btnSelect.Click  += lambda s, a: do_select()
     btnShow.Click    += lambda s, a: do_show()
     btnIso.Click     += lambda s, a: do_isolate()
-    btnClear.Click   += lambda s, a: _clear_isolate()
-    btnPrev.Click    += lambda s, a: do_prev()
-    btnNext.Click    += lambda s, a: do_next()
-    btnRefresh.Click += lambda s, a: refresh_list(select_id=current_selected_eid())
+    btnClear.Click   += lambda s, a: handler.raise_("clear_isolate")
     btnDelete.Click  += lambda s, a: do_delete()
     btnClose.Click   += lambda s, a: win.Close()
-    lst.MouseDoubleClick += lambda s, a: do_isolate()
 
-    refresh_list(select_id=None)
-    win.ShowDialog()
+    if lst:
+        lst.MouseDoubleClick += lambda s, a: do_isolate()
+
+    if cmb:
+        cmb.SelectionChanged += lambda s, a: handler.raise_("refresh")
+
+    def _on_closed(sender, args):
+        global __shn_manager_window__, __shn_manager_handler__, __shn_manager_event__
+        __shn_manager_window__ = None
+        __shn_manager_handler__ = None
+        __shn_manager_event__ = None
+
+    win.Closed += _on_closed
+
+    win.Show()
+    try:
+        win.Activate()
+    except:
+        pass
+
+    # FIXED: Initial refresh happens AFTER window is shown
+    handler.raise_("refresh")
+
 
 # -----------------------------
 # Main
@@ -1237,7 +1442,6 @@ def main():
         title="SHN"
     )
 
-    # IMPORTANT CHANGE: add direct access to Opening Manager
     mode = forms.CommandSwitchWindow.show(
         ["Create/Update + Audit", "Audit only", "Open Opening Manager (existing openings)"],
         message="Run mode"
@@ -1245,16 +1449,11 @@ def main():
     if not mode:
         return
 
-    # If user only wants the manager — do NOT ask for tolerances/links/etc.
     if mode == "Open Opening Manager (existing openings)":
         opening_symbol = pick_opening_symbol()
-        try:
-            show_opening_manager(opening_symbol, [], [])
-        except:
-            forms.alert("Could not open Opening Manager window.", title="SHN")
+        show_opening_manager(opening_symbol, [], [])
         return
 
-    # Normal flow
     opening_symbol = pick_opening_symbol()
     link_instances = pick_link_instances()
 
@@ -1270,7 +1469,7 @@ def main():
     bbox_tol_ft    = mm_to_ft(bbox_tol_mm)
     depth_extra_ft = mm_to_ft(depth_extra_mm)
 
-    output.print_md("## SHN Opening Browser v0.1")
+    output.print_md("## SHN Opening Browser v0.2 (FIXED)")
     fam_name, type_name = get_symbol_names(opening_symbol)
     output.print_md("- Opening symbol: **{} : {}**".format(fam_name, type_name))
 
@@ -1318,38 +1517,20 @@ def main():
     output.print_md("- NeedResize (openings): **{}**".format(len(set(need_resize))))
     output.print_md("- Empty openings: **{}**".format(len(empty)))
 
-    if empty:
-        action = forms.CommandSwitchWindow.show(
-            ["Nothing", "Select empty", "Delete selected empty", "Approve (keep) selected empty"],
-            message="Empty openings were found. What do you want to do?"
-        )
-        if action == "Select empty":
-            ids = List[DB.ElementId]([DB.ElementId(i) for i in empty])
-            uidoc.Selection.SetElementIds(ids)
-
-        elif action in ["Delete selected empty", "Approve (keep) selected empty"]:
-            items = ["{}".format(i) for i in empty]
-            chosen = forms.SelectFromList.show(items, title="Select empty openings", multiselect=True, button_name="OK")
-            if chosen:
-                chosen_ids = [int(x) for x in chosen]
-                t2 = DB.Transaction(doc, "SHN Openings - Empty action")
-                t2.Start()
-                if action == "Delete selected empty":
-                    for i in chosen_ids:
-                        try:
-                            doc.Delete(DB.ElementId(i))
-                        except:
-                            pass
-                else:
-                    for i in chosen_ids:
-                        try:
-                            op = doc.GetElement(DB.ElementId(i))
-                            p = lookup_param_any(op, APPROVED_NAMES)
-                            if p:
-                                set_param(p, 1)
-                        except:
-                            pass
-                t2.Commit()
+    if created:
+        output.print_md("### Created IDs")
+        for i in created:
+            try:
+                output.print_md("- {}".format(output.linkify(DB.ElementId(int(i)))))
+            except:
+                output.print_md("- {}".format(i))
+    if updated:
+        output.print_md("### Updated IDs")
+        for i in updated:
+            try:
+                output.print_md("- {}".format(output.linkify(DB.ElementId(int(i)))))
+            except:
+                output.print_md("- {}".format(i))
 
     forms.alert(
         "Done.\nCreated: {}\nUpdated: {}\nMissing requests: {}\nNeedResize: {}\nEmpty: {}".format(
@@ -1358,18 +1539,12 @@ def main():
         title="SHN Opening Browser"
     )
 
-    # Post-run: quick manager access (optional)
-    while True:
-        post = forms.CommandSwitchWindow.show(
-            ["Open Opening Manager", "Finish"],
-            message="Post-run actions"
-        )
-        if not post or post == "Finish":
-            break
-        try:
-            show_opening_manager(opening_symbol, created, updated)
-        except:
-            forms.alert("Could not open Opening Manager window.", title="SHN")
+    post = forms.CommandSwitchWindow.show(
+        ["Open Opening Manager", "Finish"],
+        message="Post-run actions"
+    )
+    if post == "Open Opening Manager":
+        show_opening_manager(opening_symbol, created, updated)
 
 if __name__ == "__main__":
     main()
