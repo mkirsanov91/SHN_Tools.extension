@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-SHN Family Browser
-------------------
+SHN Family Browser v1.1
+------------------------
 Быстрый просмотр утверждённой библиотеки семейств с категориями, превью и Description.
 
+НОВОЕ В v1.1:
+ - Современный Material Design интерфейс
+ - Увеличенные превью (128x128)
+ - Двойной клик для быстрой загрузки
+ - Счётчик найденных семейств
+ - Индикатор загруженных семейств
+ - Исправлены дубликаты кода
+ 
  - Семейства берутся из F:\REVIT_SHN\SHN_Familys\test
  - Для каждого семейства ищется PNG в папке family_previews по маске:
         <ИмяСемейства>*.png
@@ -14,12 +22,6 @@ SHN Family Browser
         * экспортирует PNG через ImageExportOptions в папку family_previews
  - В индекс добавляется параметр Description (BuiltIn ALL_MODEL_DESCRIPTION),
    если он есть у семейства/типа.
- - В окне:
-        * слева — иконка
-        * посередине — имя семейства
-        * справа — Description
-        * сверху — выбор категории + строка поиска по имени/Description
-        * категория "(All categories)" включает все семейства.
 """
 
 __title__ = 'Family\nBrowser'
@@ -45,7 +47,8 @@ clr.AddReference('WindowsBase')
 clr.AddReference('System.Core')
 from System.Runtime.CompilerServices import StrongBox
 from System.Windows import Thickness
-from System.Windows.Controls import StackPanel, Image, TextBlock, ListBoxItem
+from System.Windows.Controls import StackPanel, Image, TextBlock, ListBoxItem, Border
+from System.Windows.Media import SolidColorBrush, Color
 from System.Windows.Media.Imaging import BitmapImage, BitmapCacheOption
 from System import Uri, UriKind
 
@@ -72,8 +75,8 @@ if not os.path.exists(PREVIEW_ROOT):
 # Путь к JSON-индексу
 INDEX_PATH = os.path.join(BUTTON_DIR, 'family_index.json')
 
-# Размер картинки при экспорте
-PREVIEW_PIXEL_SIZE = 256
+# Размер картинки при экспорте (увеличен с 256 до 384 для лучшего качества)
+PREVIEW_PIXEL_SIZE = 384
 
 
 # ======================================================================
@@ -301,12 +304,22 @@ def load_index():
 
 
 # ======================================================================
-# WPF ОКНО
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: ПРОВЕРКА ЗАГРУЖЕННОСТИ
 # ======================================================================
 
-from pyrevit import forms as pyforms
-import System.Windows
+def _is_family_loaded(family_name):
+    """Проверяет, загружено ли семейство с данным именем в текущий проект."""
+    existing_fams = list(
+        DB.FilteredElementCollector(doc)
+        .OfClass(DB.Family)
+        .ToElements()
+    )
+    return any(f.Name == family_name for f in existing_fams)
 
+
+# ======================================================================
+# WPF ОКНО
+# ======================================================================
 
 from pyrevit import forms as pyforms
 import System.Windows
@@ -323,6 +336,7 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
     # ------------------------------ helpers ----------------------------
 
     def _rebuild_categories(self):
+        """Собирает список категорий и заполняет ComboBox."""
         cats = sorted(set(f.get('category', '') for f in self.families if f.get('category')))
         # добавляем вариант "All categories"
         self.categories = ['(All categories)'] + cats
@@ -347,6 +361,8 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
         if hasattr(self, 'searchBox') and self.searchBox.Text:
             query = self.searchBox.Text.strip().lower()
 
+        displayed_count = 0
+
         for fam in self.families:
             cat = fam.get('category', '')
             name = fam.get('name', '')
@@ -363,15 +379,29 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
                 if query not in name_l and query not in desc_l:
                     continue
 
+            displayed_count += 1
+
             # ------------------ UI элемент строки ------------------
+            # Используем Border вместо StackPanel для возможности добавить цветную полоску
+            main_container = Border()
+            main_container.Padding = Thickness(8)
+            
+            # Проверяем, загружено ли семейство
+            is_loaded = _is_family_loaded(name)
+            
+            # Добавляем цветную полоску слева если семейство загружено
+            if is_loaded:
+                main_container.BorderBrush = SolidColorBrush(Color.FromRgb(76, 175, 80))  # Зелёный
+                main_container.BorderThickness = Thickness(4, 0, 0, 0)
+            
             stack = StackPanel(Orientation=System.Windows.Controls.Orientation.Horizontal)
-            stack.Margin = Thickness(2)
 
             # --- картинка ---
             img = Image()
-            img.Width = 96      # 1.5x 64
-            img.Height = 96
-            img.Margin = Thickness(0, 0, 10, 0)
+            img.Width = 128      # увеличено с 96
+            img.Height = 128
+            img.Margin = Thickness(0, 0, 15, 0)
+            img.Stretch = System.Windows.Media.Stretch.UniformToFill
 
             if fam.get('preview') and os.path.exists(fam['preview']):
                 try:
@@ -385,47 +415,98 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
                 except Exception as ex:
                     print("Preview load error for {}: {}".format(fam['preview'], ex))
 
+            # --- контейнер для текстов ---
+            text_stack = StackPanel()
+            text_stack.VerticalAlignment = System.Windows.VerticalAlignment.Center
+            text_stack.Width = 600
+
             # --- имя семейства ---
             name_text = TextBlock()
             name_text.Text = name
-            name_text.VerticalAlignment = System.Windows.VerticalAlignment.Center
-            name_text.Margin = Thickness(0, 0, 20, 0)
+            name_text.FontSize = 14
+            name_text.FontWeight = System.Windows.FontWeights.Bold
             name_text.TextWrapping = System.Windows.TextWrapping.NoWrap
             name_text.TextTrimming = System.Windows.TextTrimming.CharacterEllipsis
-            name_text.Width = 250
+            name_text.Foreground = SolidColorBrush(Color.FromRgb(33, 33, 33))
 
-            # --- Description справа ---
+            # --- категория ---
+            cat_text = TextBlock()
+            cat_text.Text = u"📁 " + cat
+            cat_text.FontSize = 11
+            cat_text.Foreground = SolidColorBrush(Color.FromRgb(117, 117, 117))
+            cat_text.Margin = Thickness(0, 2, 0, 4)
+
+            # --- Description ---
             desc_text = TextBlock()
-            desc_text.Text = desc
-            desc_text.VerticalAlignment = System.Windows.VerticalAlignment.Center
-            desc_text.Margin = Thickness(0, 0, 0, 0)
-            desc_text.TextWrapping = System.Windows.TextWrapping.NoWrap
-            desc_text.TextTrimming = System.Windows.TextTrimming.CharacterEllipsis
-            desc_text.Width = 350
-            desc_text.TextAlignment = System.Windows.TextAlignment.Left
+            if desc:
+                desc_text.Text = desc
+            else:
+                desc_text.Text = "(No description)"
+                desc_text.FontStyle = System.Windows.FontStyles.Italic
+            desc_text.FontSize = 12
+            desc_text.Foreground = SolidColorBrush(Color.FromRgb(97, 97, 97))
+            desc_text.TextWrapping = System.Windows.TextWrapping.Wrap
+            desc_text.MaxHeight = 40
+
+            # --- индикатор загруженности ---
+            if is_loaded:
+                status_text = TextBlock()
+                status_text.Text = u"✓ Loaded in project"
+                status_text.FontSize = 10
+                status_text.FontWeight = System.Windows.FontWeights.Bold
+                status_text.Foreground = SolidColorBrush(Color.FromRgb(76, 175, 80))
+                status_text.Margin = Thickness(0, 4, 0, 0)
+                text_stack.Children.Add(status_text)
+
+            text_stack.Children.Add(name_text)
+            text_stack.Children.Add(cat_text)
+            text_stack.Children.Add(desc_text)
 
             stack.Children.Add(img)
-            stack.Children.Add(name_text)
-            stack.Children.Add(desc_text)
+            stack.Children.Add(text_stack)
+
+            main_container.Child = stack
 
             item = ListBoxItem()
-            item.Content = stack
+            item.Content = main_container
             item.Tag = fam  # словарь с данными о семействе
 
             self.familyList.Items.Add(item)
 
+        # Обновляем счётчик
+        self._update_status_bar(displayed_count)
+
+    def _update_status_bar(self, count):
+        """Обновляет статус бар с количеством семейств."""
+        if hasattr(self, 'statusText'):
+            total = len(self.families)
+            if count == total:
+                self.statusText.Text = u"📊 Showing all families"
+            else:
+                self.statusText.Text = u"📊 Filtered results"
+        
+        if hasattr(self, 'countText'):
+            if count == 1:
+                self.countText.Text = "1 family"
+            else:
+                self.countText.Text = "{} families".format(count)
+
     # ------------------------------ XAML handlers ----------------------
 
     def categoryCombo_SelectionChanged(self, sender, args):
+        """Обработчик изменения категории."""
         self._populate_family_list()
 
     def searchBox_TextChanged(self, sender, args):
+        """Обработчик изменения текста поиска."""
         self._populate_family_list()
 
     def close_button_click(self, sender, args):
+        """Обработчик кнопки Close."""
         self.Close()
 
     def refresh_button_click(self, sender, args):
+        """Обработчик кнопки Refresh - перестраивает индекс."""
         res = forms.alert(
             u"Rebuild family library index?\n"
             u"This may take a while.",
@@ -438,8 +519,16 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
         self.families = new_fams
         self._rebuild_categories()
 
+    def familyList_DoubleClick(self, sender, args):
+        """Обработчик двойного клика - быстрая загрузка семейства."""
+        self._load_selected_family()
+
     def load_button_click(self, sender, args):
-        # === ЭТОТ МЕТОД НУЖЕН ДЛЯ XAML ===
+        """Обработчик кнопки Load - загружает выбранное семейство."""
+        self._load_selected_family()
+
+    def _load_selected_family(self):
+        """Основная логика загрузки семейства."""
         item = self.familyList.SelectedItem
         if not item:
             forms.alert(u"Please select a family first.")
@@ -453,29 +542,28 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
             forms.alert(u"Family file not found:\n{}".format(fam_path), warn_icon=True)
             return
 
-        # ---- ПРОВЕРКА: есть ли семейство в модели ----
-        existing_fams = list(
-            DB.FilteredElementCollector(doc)
-            .OfClass(DB.Family)
-            .ToElements()
-        )
-        is_loaded = any(f.Name == fam_name for f in existing_fams)
+        # ---- ПРОВЕРЯЕМ, ЕСТЬ ЛИ СЕМЕЙСТВО В МОДЕЛИ ----
+        is_loaded = _is_family_loaded(fam_name)
 
+        # Если семейства НЕТ в проекте → НЕ спрашиваем overwrite
         if is_loaded:
             overwrite = forms.alert(
-                u"Overwrite existing family types if family is already loaded?",
+                u"Family '{}' is already loaded.\n\n"
+                u"Overwrite existing family types?".format(fam_name),
                 yes=True, no=True, cancel=True
             )
+
             if overwrite is None:
                 return
+
             overwrite_flag = bool(overwrite)
         else:
-            overwrite_flag = False   # семейства ещё нет — просто загружаем
+            overwrite_flag = False   # загружаем без overwrite
 
         # ---- ЗАГРУЗКА ----
         fam_ref = StrongBox[DB.Family](None)
 
-        t = DB.Transaction(doc, "Load approved family")
+        t = DB.Transaction(doc, "Load SHN approved family")
         t.Start()
         try:
             load_opts = SimpleFamilyLoadOptions(overwrite_flag)
@@ -483,7 +571,9 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
             loaded = doc.LoadFamily(fam_path, load_opts, fam_ref)
 
             if loaded:
-                forms.alert(u"Family '{}' loaded successfully.".format(fam_name))
+                forms.alert(u"✓ Family '{}' loaded successfully!".format(fam_name))
+                # Обновляем отображение после загрузки
+                self._populate_family_list()
             else:
                 forms.alert(u"Failed to load family:\n{}".format(fam_path), warn_icon=True)
 
@@ -492,92 +582,8 @@ class FamilyBrowserWindow(pyforms.WPFWindow):
             t.RollBack()
             forms.alert(u"Error while loading family:\n{}\n\n{}".format(fam_path, ex), warn_icon=True)
         finally:
-            self.Close()
-
-    # ------------------------------ XAML handlers ----------------------
-
-    def categoryCombo_SelectionChanged(self, sender, args):
-        self._populate_family_list()
-
-    def searchBox_TextChanged(self, sender, args):
-        self._populate_family_list()
-
-    def close_button_click(self, sender, args):
-        self.Close()
-
-    def refresh_button_click(self, sender, args):
-        res = forms.alert(
-            u"Rebuild family library index?\n"
-            u"This may take a while.",
-            yes=True, no=True
-        )
-        if not res:
-            return
-
-        new_fams = build_index(show_alert=False)
-        self.families = new_fams
-        self._rebuild_categories()
-
-def load_button_click(self, sender, args):
-    item = self.familyList.SelectedItem
-    if not item:
-        forms.alert(u"Please select a family first.")
-        return
-
-    fam_info = item.Tag
-    fam_path = fam_info['path']
-    fam_name = fam_info['name']
-
-    if not os.path.exists(fam_path):
-        forms.alert(u"Family file not found:\n{}".format(fam_path), warn_icon=True)
-        return
-
-    # ---- ПРОВЕРЯЕМ, ЕСТЬ ЛИ РЕАЛЬНО СЕМЕЙСТВО В МОДЕЛИ ----
-    existing_fams = list(
-        DB.FilteredElementCollector(doc)
-        .OfClass(DB.Family)
-        .ToElements()
-    )
-
-    is_loaded = any(f.Name == fam_name for f in existing_fams)
-
-    # Если семейства НЕТ в проекте → НЕ спрашиваем overwrite
-    if is_loaded:
-        overwrite = forms.alert(
-            u"Overwrite existing family types if family is already loaded?",
-            yes=True, no=True, cancel=True
-        )
-
-        if overwrite is None:
-            return
-
-        overwrite_flag = bool(overwrite)
-    else:
-        overwrite_flag = False   # загружаем без overwrite
-
-    # ---- ЗАГРУЗКА ----
-    from System.Runtime.CompilerServices import StrongBox
-    fam_ref = StrongBox[DB.Family](None)
-
-    t = DB.Transaction(doc, "Load approved family")
-    t.Start()
-    try:
-        load_opts = SimpleFamilyLoadOptions(overwrite_flag)
-
-        loaded = doc.LoadFamily(fam_path, load_opts, fam_ref)
-
-        if loaded:
-            forms.alert(u"Family '{}' loaded successfully.".format(fam_name))
-        else:
-            forms.alert(u"Failed to load family:\n{}".format(fam_path), warn_icon=True)
-
-        t.Commit()
-    except Exception as ex:
-        t.RollBack()
-        forms.alert(u"Error while loading family:\n{}\n\n{}".format(fam_path, ex), warn_icon=True)
-    finally:
-        self.Close()
-
+            # НЕ закрываем окно после загрузки, чтобы можно было загрузить ещё семейства
+            pass
 
 
 # ======================================================================
@@ -590,4 +596,3 @@ if families is None:
 
 window = FamilyBrowserWindow(families)
 window.ShowDialog()
-# ======================================================================
